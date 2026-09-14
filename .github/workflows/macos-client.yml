@@ -1,0 +1,303 @@
+# aZTNA macOS client lanes — public mirror venue.
+#
+# WHY PUBLIC (W30 D1 venue amendment, owner GO 2026-09-14): standard
+# GitHub-hosted runners — macOS included — are free for public repos;
+# the private product repo's macOS minutes bill at 10x against a capped
+# budget. This mirror carries ONLY the client subset (aztna-client +
+# aztna-common + aztna-keys; no wire-protocol crate, no
+# controller/gateway), so every lane below is client-only.
+#
+# The control-plane-dependent lanes (core U-plane, extended+security)
+# stay on the private repo's macos-build.yml — they cannot run here.
+name: macos-client
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      matrix_sleep:
+        description: "wedge-matrix cell A: plain out-of-tree background survivor"
+        type: boolean
+        default: false
+      matrix_launchd:
+        description: "cell B: launchd daemon, KeepAlive=false, no Sockets"
+        type: boolean
+        default: false
+      matrix_keepalive:
+        description: "cell C: launchd + KeepAlive (respawn proof) then disable+bootout"
+        type: boolean
+        default: false
+      matrix_socket:
+        description: "cell D: cell C + launchd-owned Sockets socket (full repro shape)"
+        type: boolean
+        default: false
+      matrix_installer:
+        description: "cell E: installer + postinstall only (no launchd anywhere)"
+        type: boolean
+        default: false
+      matrix_installer_pkg:
+        description: "cell F: the REAL aztna pkg (postinstall launchctl from installd ctx) - install only"
+        type: boolean
+        default: false
+      matrix_lane_install:
+        description: "cell G: the pkg LANE, stop after the install section"
+        type: boolean
+        default: false
+      matrix_lane_daemon:
+        description: "cell H: the pkg LANE, stop after the daemon section"
+        type: boolean
+        default: false
+      matrix_lane_sec:
+        description: "cell I: the pkg LANE, stop after the security section"
+        type: boolean
+        default: false
+
+jobs:
+  client-lanes:
+    # The wedge-matrix cells ride the same job (inputs default false on
+    # push): each cell is a SELF-CONTAINED step with its own teardown,
+    # started fresh after checkout/toolchain/build so target/debug/glmsvc
+    # exists. Discriminator per cell: does the RUN finalize with logs
+    # (any conclusion) or wedge in_progress past its timeout?
+    if: ${{ !(inputs.matrix_sleep || inputs.matrix_launchd || inputs.matrix_keepalive || inputs.matrix_socket || inputs.matrix_installer || inputs.matrix_installer_pkg || inputs.matrix_lane_install || inputs.matrix_lane_daemon || inputs.matrix_lane_sec) }}
+    runs-on: macos-15   # pinned (never macos-latest), Apple silicon
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Rust toolchain
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Print toolchain + host
+        run: |
+          rustc --version && cargo --version
+          sysctl -n machdep.cpu.brand_string
+          sw_vers
+
+      - name: Cache cargo (registry + git + target)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: macos-client-cargo-${{ hashFiles('**/Cargo.toml') }}
+          restore-keys: macos-client-cargo-
+
+      - name: Build client + shared crates (gate)
+        run: cargo build -p aztna-client -p aztna-common -p aztna-keys
+
+      - name: Unit tests (gate)
+        run: cargo test -p aztna-client -p aztna-common -p aztna-keys
+
+      - name: Format check (gate)
+        run: cargo fmt -p aztna-client -p aztna-common -p aztna-keys -- --check
+
+      - name: Clippy (advisory — pre-existing baseline)
+        run: cargo clippy -p aztna-client || echo "clippy warnings present (baseline-tracked, advisory)"
+
+      - name: x86_64-apple-darwin cross-build (D2 build-only)
+        # aarch64 is first-class (all lanes); Intel Macs must COMPILE for
+        # the version-compatibility matrix — no e2e lane, same runner.
+        run: |
+          rustup target add x86_64-apple-darwin
+          cargo build -p aztna-client --target x86_64-apple-darwin
+          file target/x86_64-apple-darwin/debug/glmsvc
+
+      - name: Loopback aliases (lanes reuse the 127.0.0.x family)
+        run: |
+          for ip in $(seq 2 30) 210 211; do sudo ifconfig lo0 alias 127.0.0.$ip up; done
+          ifconfig lo0 | grep -c "inet 127"
+
+      - name: Darwin IPC hard-gate lane (acceptance matrix)
+        run: python3 tests-e2e/macos/ipc_matrix.py
+
+      - name: LaunchDaemon + .pkg lifecycle lane
+        # WEDGE FIX BY CONSTRUCTION (owner GO 2026-09-14): the lane
+        # detaches from the runner agent's pipes entirely (output to a
+        # file, stdin /dev/null, cat-back after completion) so NO
+        # descendant can hold the agent's output stream hostage, and the
+        # lane itself disables+boots out the KeepAlive job right after
+        # proving restart (no un-supervised respawn loop can exist).
+        # Backstops unchanged: step timeout + the always() teardown
+        # step + artifact upload.
+        timeout-minutes: 10
+        run: |
+          python3 tests-e2e/macos/client_pkg.py >/tmp/lane.log 2>&1 </dev/null &
+          LANE=$!
+          # errexit-safe wait: the runner shell is bash -e; a bare
+          # `wait $LANE` carrying the lane's nonzero rc kills the
+          # wrapper BEFORE the cat (run 34860826965 lost its output
+          # exactly this way - lane exit 1 = ONE failed check).
+          RC=0
+          wait $LANE || RC=$?
+          echo "--- lane output (cat from /tmp/lane.log) ---"
+          cat /tmp/lane.log
+          cp /tmp/lane.log ~/aztna-w30-pkg-run/lane.log 2>/dev/null || true
+          sudo -n launchctl bootout system/com.aztna.client 2>/dev/null || true
+          sudo -n rm -rf /var/run/aztna-client 2>/dev/null || true
+          exit $RC
+
+      - name: pkg-lane teardown (always - boots the KeepAlive daemon out)
+        if: always()
+        run: |
+          sudo -n launchctl bootout system/com.aztna.client 2>&1 || echo "bootout rc=$? (already out?)"
+          sudo -n launchctl disable system/com.aztna.client 2>&1 || true
+          sudo -n rm -rf /var/run/aztna-client 2>/dev/null || true
+          echo "--- survivors ---"
+          ps aux | grep -i "[g]lmsvc" || echo "(no glmsvc running)"
+          echo "--- daemon log tail ---"
+          sudo -n tail -40 /var/log/aztna-client.log 2>/dev/null || echo "(no daemon log)"
+          echo "--- fd dump ---"
+          sudo -n cat /var/lib/aztna-client/fd-dump.txt 2>/dev/null || echo "(no fd dump)"
+
+      - name: Upload pkg-lane run dir (evidence)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pkg-lane-run
+          path: /Users/runner/aztna-w30-pkg-run/
+          if-no-files-found: ignore
+
+      - name: Secure Enclave availability probe (EVIDENCE ONLY — never a gate)
+        run: |
+          rustc --edition 2021 tests-e2e/macos/se_probe.rs -o /tmp/se_probe             -l framework=Security -l framework=CoreFoundation
+          codesign -s - /tmp/se_probe
+          set +e
+          /tmp/se_probe 2>&1 | tee se-probe-out.txt
+          echo "probe_exit_code=${PIPESTATUS[0]}" | tee -a se-probe-out.txt
+          exit 0
+
+  # ---- wedge isolation matrix (reviewer round 1, 2026-09-14) ----
+  # One cell per dispatch (one boolean true). Each cell is minimal, has
+  # its own teardown, and the SHARED always-teardown below boots any
+  # leftover job out. Discriminator: the run FINALIZES with logs vs
+  # wedges in_progress past its 8-min job timeout (the pkg-lane wedge
+  # shape). Cell D reproduces the lane's launchd topology WITHOUT
+  # installer; cell E runs installer WITHOUT launchd — together they
+  # split the two prime suspects (reviewer 1: installer tty/pipe;
+  # reviewer 2: runner finalization vs launchd topology).
+  wedge-matrix:
+    if: ${{ inputs.matrix_sleep || inputs.matrix_launchd || inputs.matrix_keepalive || inputs.matrix_socket || inputs.matrix_installer || inputs.matrix_installer_pkg || inputs.matrix_lane_install || inputs.matrix_lane_daemon || inputs.matrix_lane_sec }}
+    runs-on: macos-15
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+      - name: Rust toolchain + build glmsvc (needed by cells B-D)
+        run: |
+          rustup toolchain install stable --profile minimal
+          cargo build -p aztna-client
+      - name: Runner identity capture (runner-version correlation, reviewer 2)
+        run: env | grep -E '^RUNNER|^ACTIONS_' | sort || true
+      - name: Out-of-band process sampler (started BEFORE any risky step)
+        run: |
+          nohup bash -c 'while true; do date -u +%H:%M:%S;             ps -axo pid,ppid,pgid,tty,stat,command | grep -E "[R]unner|[p]ython3|[s]udo|[i]nstaller|[l]aunchctl|[g]lmsvc" || true;             sleep 2; done' > /tmp/aztna-watch.log 2>&1 &
+          echo "sampler pid $! writing /tmp/aztna-watch.log"
+      - name: CELL A - plain out-of-tree background survivor
+        if: ${{ inputs.matrix_sleep }}
+        run: |
+          nohup sleep 300 >/dev/null 2>&1 &
+          echo "cell A: spawned survivor $! (outlives this step)"
+          sleep 2
+          echo "CELL A DONE"
+      - name: CELL B - launchd daemon, KeepAlive=false, no Sockets
+        if: ${{ inputs.matrix_launchd }}
+        run: |
+          mkdir -p /tmp/matrix-home
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?> <plist version="1.0"><dict> <key>Label</key><string>com.aztna.matrix</string> <key>ProgramArguments</key><array> <string>/Users/runner/work/mac_client/mac_client/target/debug/glmsvc</string></array> <key>RunAtLoad</key><true/> <key>KeepAlive</key><false/> <key>EnvironmentVariables</key><dict> <key>AZTNA_SVC_HOME</key><string>/tmp/matrix-home</string></dict> </dict></plist>' > /tmp/matrix.plist
+          sudo -n launchctl bootstrap system /tmp/matrix.plist
+          sleep 5
+          sudo -n launchctl print system/com.aztna.matrix | grep -E 'state|pid' || true
+          ps -axo pid,ppid,pgid,tty,stat,command | grep '[g]lmsvc' || echo '(no glmsvc process!)'
+          sudo -n lsof -nP -p "$(pgrep -x glmsvc | head -1)" 2>/dev/null | head -20 || true
+          sudo -n launchctl bootout system/com.aztna.matrix
+          echo "CELL B DONE"
+      - name: CELL C - launchd + KeepAlive (respawn proof) then disable+bootout
+        if: ${{ inputs.matrix_keepalive }}
+        run: |
+          mkdir -p /tmp/matrix-home
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?> <plist version="1.0"><dict> <key>Label</key><string>com.aztna.matrix</string> <key>ProgramArguments</key><array> <string>/Users/runner/work/mac_client/mac_client/target/debug/glmsvc</string></array> <key>RunAtLoad</key><true/> <key>KeepAlive</key><true/> <key>ThrottleInterval</key><integer>5</integer> <key>EnvironmentVariables</key><dict> <key>AZTNA_SVC_HOME</key><string>/tmp/matrix-home</string></dict> </dict></plist>' > /tmp/matrix.plist
+          # bootstrap error-5s from the step shell (cell B evidence) - the
+          # legacy load path is what the lane's ensure_daemon falls back to
+          sudo -n launchctl bootstrap system /tmp/matrix.plist || sudo -n launchctl load /tmp/matrix.plist
+          sleep 5
+          P1=$(pgrep -x glmsvc | head -1); echo "pid after bootstrap: $P1"
+          sudo -n kill -9 "$P1"; sleep 7
+          P2=$(pgrep -x glmsvc | head -1); echo "pid after SIGKILL: $P2 (keepalive proof: differs)"
+          sudo -n launchctl disable system/com.aztna.matrix
+          sudo -n launchctl bootout system/com.aztna.matrix
+          sleep 3
+          pgrep -x glmsvc || echo '(quiet - no glmsvc)'
+          echo "CELL C DONE"
+      - name: CELL D - cell C + launchd-owned Sockets socket (full repro shape)
+        if: ${{ inputs.matrix_socket }}
+        run: |
+          mkdir -p /tmp/matrix-home
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?> <plist version="1.0"><dict> <key>Label</key><string>com.aztna.matrix</string> <key>ProgramArguments</key><array> <string>/Users/runner/work/mac_client/mac_client/target/debug/glmsvc</string></array> <key>RunAtLoad</key><true/> <key>KeepAlive</key><true/> <key>ThrottleInterval</key><integer>5</integer> <key>EnvironmentVariables</key><dict> <key>AZTNA_SVC_HOME</key><string>/tmp/matrix-home</string> <key>AZTNA_LAUNCHD_SOCKETS</key><string>1</string></dict> <key>Sockets</key><dict><key>ipc</key><dict> <key>SockPathName</key><string>/tmp/matrix-home/ipc.sock</string> <key>SockPathMode</key><integer>438</integer></dict></dict> </dict></plist>' > /tmp/matrix.plist
+          sudo -n launchctl bootstrap system /tmp/matrix.plist || sudo -n launchctl load /tmp/matrix.plist
+          sleep 5
+          stat /tmp/matrix-home/ipc.sock || echo '(no socket file)'
+          ps -axo pid,ppid,pgid,tty,stat,command | grep '[g]lmsvc' || echo '(no glmsvc - fd-probe may bail)'
+          sudo -n lsof -nP -p "$(pgrep -x glmsvc | head -1)" 2>/dev/null | grep -E 'ipc.sock|unix|fd' | head -10 || true
+          sudo -n launchctl disable system/com.aztna.matrix
+          sudo -n launchctl bootout system/com.aztna.matrix
+          sleep 3
+          pgrep -x glmsvc || echo '(quiet)'
+          echo "CELL D DONE"
+      - name: CELL E - installer + postinstall ONLY (no launchd anywhere)
+        if: ${{ inputs.matrix_installer }}
+        run: |
+          STAGE=$(mktemp -d)/root; mkdir -p "$STAGE/usr/local/aztna-matrix"
+          echo matrix > "$STAGE/usr/local/aztna-matrix/payload.txt"
+          SCR=$(mktemp -d)/scripts; mkdir -p "$SCR"
+          printf '#!/bin/bash\nmkdir -p /tmp/matrix-installer-ran\necho hi > /tmp/matrix-installer-ran/marker\nexit 0\n' > "$SCR/postinstall"
+          chmod +x "$SCR/postinstall"
+          pkgbuild --root "$STAGE" --scripts "$SCR" --identifier com.aztna.matrix --version 1.0 /tmp/matrix.pkg
+          sudo -n installer -pkg /tmp/matrix.pkg -target /
+          cat /tmp/matrix-installer-ran/marker 2>/dev/null || echo '(postinstall marker missing)'
+          sudo -n rm -rf /usr/local/aztna-matrix /tmp/matrix-installer-ran
+          sudo -n pkgutil --forget com.aztna.matrix
+          echo "CELL E DONE"
+      - name: CELL F - the REAL aztna pkg, install ONLY (the decisive cell)
+        # A (survivor), B/C (launchd from shell - cannot even load), E
+        # (installer, no launchd) all FINALIZE. The lanes' remaining
+        # delta: postinstall's launchctl runs from INSTALLD's context
+        # inside a SUCCESSFUL install - the one session that may
+        # actually load the system daemon on this runner. This cell
+        # installs the real pkg (real plist + tolerant postinstall) and
+        # does NOTHING else - no shell launchctl, no lane logic. Wedge
+        # here = installd-loaded LaunchDaemon is the trigger.
+        if: ${{ inputs.matrix_installer_pkg }}
+        run: |
+          env AZTNA_PKG_BIN_DIR=target/debug bash deploy/macos/client/build-pkg.sh 0.30.0 /tmp/f-real.pkg
+          sudo -n rm -rf /var/lib/aztna-client /var/run/aztna-client
+          sudo -n installer -pkg /tmp/f-real.pkg -target /
+          echo "install rc=$?"
+          ls -la /usr/local/aztna/bin/ /Library/LaunchDaemons/com.aztna.client.plist /var/run/aztna-client 2>/dev/null || true
+          ps -axo pid,ppid,pgid,tty,stat,command | grep '[g]lmsvc' || echo '(no glmsvc running)'
+          stat /var/run/aztna-client/ipc.sock 2>/dev/null || echo '(no socket)'
+          echo "CELL F DONE"
+      - name: CELL G - the pkg LANE, stop after install
+        if: ${{ inputs.matrix_lane_install }}
+        run: AZTNA_PKG_STOP_AFTER=install python3 tests-e2e/macos/client_pkg.py
+      - name: CELL H - the pkg LANE, stop after daemon
+        if: ${{ inputs.matrix_lane_daemon }}
+        run: AZTNA_PKG_STOP_AFTER=daemon python3 tests-e2e/macos/client_pkg.py
+      - name: CELL I - the pkg LANE, stop after sec
+        if: ${{ inputs.matrix_lane_sec }}
+        run: AZTNA_PKG_STOP_AFTER=sec python3 tests-e2e/macos/client_pkg.py
+      - name: Matrix teardown (always)
+        if: always()
+        run: |
+          for L in com.aztna.matrix com.aztna.client; do
+            sudo -n launchctl disable "system/$L" 2>/dev/null || true
+            sudo -n launchctl bootout "system/$L" 2>/dev/null || echo "$L already out"
+          done
+          sudo -n rm -rf /tmp/matrix-home /tmp/matrix.plist /var/run/aztna-client 2>/dev/null || true
+          echo "--- survivors ---"; ps aux | grep -i "[g]lmsvc" || echo "(none)"
+          echo "--- watch tail ---"; tail -40 /tmp/aztna-watch.log 2>/dev/null || true
+          echo "--- daemon log tail ---"
+          sudo -n tail -40 /var/log/aztna-client.log 2>/dev/null || echo "(no daemon log)"
+          echo "--- fd dump ---"
+          sudo -n cat /var/lib/aztna-client/fd-dump.txt 2>/dev/null || echo "(no fd dump)"

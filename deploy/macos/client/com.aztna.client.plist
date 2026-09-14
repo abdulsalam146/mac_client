@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- W30 step 8 (plan §3.8): the aZTNA client LaunchDaemon.
+     Hardening: launchd has no systemd-style directive set — this plist
+     carries what launchd actually supports, each with why:
+       RunAtLoad + KeepAlive  = start at boot, restart on crash
+       IPC socket            = the daemon self-binds /var/run/aztna-client/
+                                ipc.sock with an explicit chmod 0666 inside
+                                a root-owned 0755 dir (the W29 round-3
+                                lesson). launchd Sockets-dict activation
+                                was built and probed (fd 0..=64, sun_path,
+                                SO_ACCEPTCONN, inode identity - evidence
+                                archived in the W30 wedge review doc);
+                                on the macOS-15 CI image the handoff could
+                                not be identified (three unnamed bound-not-
+                                listening sockets, none matching). Revisit
+                                on owner hardware (owner-to-production 1.10).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.aztna.client</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/local/aztna/bin/glmsvc</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>5</integer>
+    <key>StandardOutPath</key>
+    <string>/var/log/aztna-client.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/aztna-client.log</string>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>AZTNA_SVC_HOME</key>
+        <string>/var/lib/aztna-client</string>
+    </dict>
+</dict>
+</plist>
