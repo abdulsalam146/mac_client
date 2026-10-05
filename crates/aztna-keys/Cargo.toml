@@ -1,0 +1,20 @@
+[package]
+name = "aztna-keys"
+version.workspace = true
+edition.workspace = true
+
+# W23 S3 [gap 2.12]: the shared key-at-rest wrap core, promoted verbatim
+# from controller/src/dpapi.rs (W21). PURE primitives only — no metrics,
+# no logging, no process state; callers own their observability. The
+# controller re-exports these with zero behavior change; the gateway
+# consumes them for gw-key.pem at rest.
+
+[dependencies]
+anyhow = { workspace = true }
+chacha20poly1305 = "0.10"
+argon2 = "0.5"
+rand = "0.8"
+
+[target.'cfg(windows)'.dependencies.windows]
+version = "0.58"
+features = ["Win32_Security_Cryptography"]

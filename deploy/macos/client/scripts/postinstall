@@ -1,0 +1,31 @@
+#!/bin/bash
+# W30 step 8: postinstall — NEVER fails the install for launchd state.
+# File/config setup must land atomically; starting the service NOW is
+# best-effort: installd's launchd context commonly refuses bootstrap
+# ("Input/output error 5" on macOS 13+) — the job then loads at next
+# boot, and admins/CI bring it up explicitly (launchctl bootstrap ||
+# load, then kickstart). NEVER touches /var/lib/aztna-client content
+# (identity must survive upgrades byte-for-byte); creates the state
+# dir only if absent.
+set -e
+STATE=/var/lib/aztna-client
+RUNDIR=/var/run/aztna-client
+# STATE is the at-rest identity dir: the client's hygiene check REQUIRES
+# 0700 (the W29 contract; 0755 made every daemon start exit fail-closed
+# - the crash-loop behind this lane's daemon FAILs, found via the
+# daemon-log tail 2026-09-14). RUNDIR is the launchd socket dir:
+# root-owned 0755 by design (the 0666 socket lives in it).
+mkdir -p "$STATE" "$RUNDIR"
+chmod 0700 "$STATE"
+chmod 0755 "$RUNDIR"
+# default svc.toml only when none exists (never clobber live config)
+if [ ! -f "$STATE/svc.toml" ]; then
+    printf 'ipc_bind = "/var/run/aztna-client/ipc.sock"\n' > "$STATE/svc.toml"
+    chmod 0600 "$STATE/svc.toml"
+fi
+# best-effort bring-up — stderr lands in /var/log/install.log (kept)
+launchctl bootstrap system /Library/LaunchDaemons/com.aztna.client.plist \
+  || launchctl load /Library/LaunchDaemons/com.aztna.client.plist \
+  || true
+launchctl kickstart -k system/com.aztna.client || true
+exit 0

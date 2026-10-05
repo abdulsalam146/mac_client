@@ -1,0 +1,8 @@
+#!/bin/bash
+# W30 step 8: prerm — stop + unload the daemon; NEVER removes state
+# (uninstall disposition documented: binaries+daemon go, state stays).
+set -e
+launchctl bootout system/com.aztna.client 2>/dev/null \
+  || launchctl unload /Library/LaunchDaemons/com.aztna.client.plist 2>/dev/null || true
+rm -f /var/run/aztna-client/ipc.sock
+exit 0
